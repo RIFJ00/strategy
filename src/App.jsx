@@ -1,11 +1,11 @@
 /**
- * 会議体ダッシュボード (リンク機能強化・最終版)
+ * 会議体ダッシュボード (リンク機能・当たり判定完全版)
  * --------------------------------------------------
- * [修正ポイント]
- * 1. リンクのクリック範囲を拡大し、z-indexを調整して確実に反応するように修正。
- * 2. URLの取得ロジックを強化し、大文字・小文字・全角の「URL」に対応。
- * 3. 回次（第N回）の自動抽出保存機能を維持。
- * 4. 分野の登録順固定（createdAt順）を維持。
+ * [修正内容]
+ * 1. リンクの当たり判定をセル全体に拡大。どこをクリックしても反応するように修正。
+ * 2. データ取得の柔軟化: 'URL', 'url', 'ＵＲＬ', 'リンク', 'link' のすべてに対応。
+ * 3. 視覚的効果: リンクがある場所はマウスを乗せると背景色が変わり、指先マークに。
+ * 4. 既存機能（回次保存・分野順固定・エラー解除・スリープ防止）をすべて完備。
  */
 
 import React, { useState, useEffect, useRef, useMemo } from 'react';
@@ -21,7 +21,6 @@ import {
   RefreshCw, Edit3, X, Database, PlayCircle, Loader2, Tag, Filter, Save, UserCheck, WifiOff, CheckSquare, Square, StopCircle, Play, RotateCcw, Eye, EyeOff, Bookmark, MapPin, Power, HelpCircle
 } from 'lucide-react';
 
-// --- Firebase 設定 ---
 const firebaseConfig = {
   apiKey: "AIzaSyBx5e752GWfvJDZ3lEx0IcArxjvCEz7S2M",
   authDomain: "seisakuresearch00.firebaseapp.com",
@@ -137,8 +136,8 @@ export default function App() {
       const data = snapshot.docs.map(doc => {
         const d = doc.data();
         const rawDateStr = d['直近開催日'] || d.latestDateString || '';
-        // 修正：URL取得を確実に
-        const url = (d['URL'] || d['url'] || d['ＵＲＬ'] || '').trim();
+        // 改善：あらゆるURLの命名に対応
+        const url = (d['URL'] || d['url'] || d['ＵＲＬ'] || d['リンク'] || d['link'] || '').trim();
         
         return {
           id: doc.id,
@@ -422,45 +421,40 @@ export default function App() {
                         )}
                       </div>
                     </td>
-                    <td className="px-6 py-4 align-middle relative">
-                      {/* 修正：会議体名リンク（クリックを邪魔しないようrelative/z-index調整） */}
-                      <div className="relative z-10">
-                        {m.url ? (
-                          <a 
-                            href={m.url} 
-                            target="_blank" 
-                            rel="noopener noreferrer" 
-                            className="group/link inline-block cursor-pointer"
-                            onClick={(e) => e.stopPropagation()}
-                          >
-                            <div className="font-black text-gray-900 text-sm leading-tight line-clamp-1 group-hover/link:text-indigo-600 group-hover/link:underline transition-all">
-                              {m.meetingName}
-                            </div>
-                          </a>
-                        ) : (
-                          <div className="font-black text-gray-400 text-sm leading-tight line-clamp-1 italic">
-                            {m.meetingName} (URLなし)
+                    {/* 会議体名セル：全体をクリック可能に強化 */}
+                    <td className="p-0 align-middle relative overflow-hidden group/cell min-w-[300px]">
+                      {m.url ? (
+                        <a 
+                          href={m.url} 
+                          target="_blank" 
+                          rel="noopener noreferrer" 
+                          className="block w-full h-full p-6 no-underline transition-colors hover:bg-indigo-50/50"
+                        >
+                          <div className="font-black text-gray-900 text-sm leading-tight line-clamp-2 group-hover/cell:text-indigo-600 group-hover/cell:underline transition-all">
+                            {m.meetingName}
                           </div>
-                        )}
-                      </div>
-                      <div className="flex flex-wrap items-center gap-2 mt-1 opacity-70">
-                        <span className="flex items-center gap-1 text-[8px] font-black text-indigo-600 bg-indigo-50 px-1.5 py-0.5 rounded border border-indigo-100 shadow-sm"><Tag className="w-2.5 h-2.5" /> {m.relatedField || '-'}</span>
-                        <span className="flex items-center gap-1 text-[8px] font-black text-gray-500 bg-gray-50 px-1.5 py-0.5 rounded border border-gray-200 shadow-sm"><MapPin className="w-2.5 h-2.5" /> {m.agency}</span>
-                      </div>
+                          <div className="flex flex-wrap items-center gap-2 mt-2 opacity-70">
+                            <span className="flex items-center gap-1 text-[8px] font-black text-indigo-600 bg-indigo-50 px-1.5 py-0.5 rounded border border-indigo-100 shadow-sm"><Tag className="w-2.5 h-2.5" /> {m.relatedField || '-'}</span>
+                            <span className="flex items-center gap-1 text-[8px] font-black text-gray-500 bg-gray-50 px-1.5 py-0.5 rounded border border-gray-200 shadow-sm"><MapPin className="w-2.5 h-2.5" /> {m.agency}</span>
+                          </div>
+                        </a>
+                      ) : (
+                        <div className="p-6">
+                          <div className="font-black text-gray-400 text-sm leading-tight line-clamp-1 italic">{m.meetingName} (URLなし)</div>
+                        </div>
+                      )}
                     </td>
                     <td className="px-6 py-4 align-middle text-center"><div className="flex flex-col items-center justify-center gap-0.5"><div className={`text-xs font-black ${m.status === 'updated' && !m.isManual ? 'text-red-600 animate-pulse' : 'text-gray-600'}`}>{m.latestDateString || '未定'}</div>{m.previousDateString && <div className="text-[10px] text-gray-400 font-bold opacity-70 line-through leading-none">{m.previousDateString}</div>}</div></td>
-                    <td className="px-8 py-4 align-middle text-right relative">
-                      <div className="flex justify-end items-center gap-1.5 opacity-30 group-hover:opacity-100 transition-opacity relative z-10">
+                    <td className="px-8 py-4 align-middle text-right">
+                      <div className="flex justify-end items-center gap-1.5 opacity-30 group-hover:opacity-100 transition-opacity">
                         <button onClick={(e) => { e.stopPropagation(); executeCheck(m); }} disabled={checkingId === m.id || isBulkChecking} className="p-2 text-indigo-600 bg-white border border-indigo-50 rounded-xl hover:bg-indigo-600 hover:text-white transition-all shadow-sm active:scale-90 shadow-indigo-100">{checkingId === m.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <PlayCircle className="w-4 h-4" />}</button>
                         <button onClick={(e) => { e.stopPropagation(); setEditTarget(m); }} disabled={isBulkChecking} className="p-2 text-blue-600 bg-white border border-blue-50 rounded-xl hover:bg-blue-600 hover:text-white transition-all shadow-sm active:scale-90"><Edit3 className="w-4 h-4" /></button>
-                        {/* 修正：地球儀アイコンのリンク */}
                         {m.url && (
                           <a 
                             href={m.url} 
                             target="_blank" 
                             rel="noopener noreferrer" 
-                            className="p-2 text-gray-400 bg-white border border-gray-100 rounded-xl hover:text-indigo-600 transition-all shadow-sm cursor-pointer inline-flex items-center"
-                            onClick={(e) => e.stopPropagation()}
+                            className="p-2 text-gray-400 bg-white border border-gray-100 rounded-xl hover:text-indigo-600 transition-all shadow-sm inline-flex items-center"
                           >
                             <ExternalLink className="w-4 h-4" />
                           </a>
@@ -475,7 +469,6 @@ export default function App() {
         </div>
       </div>
 
-      {/* 巡回パネル */}
       {isBulkChecking && (
         <div className="fixed bottom-8 right-8 bg-white p-8 rounded-[2.5rem] shadow-2xl border-2 border-indigo-50 z-50 w-80 animate-in slide-in-from-right-10">
           <div className="flex items-center justify-between mb-6">
@@ -499,7 +492,6 @@ export default function App() {
         </div>
       )}
 
-      {/* 編集モーダル */}
       {editTarget && (
         <div className="fixed inset-0 bg-gray-900/70 backdrop-blur-md flex items-center justify-center z-50 p-4 font-sans">
           <div className="bg-white rounded-[2.5rem] shadow-2xl w-full max-w-md p-8 border border-gray-100 animate-in zoom-in-95 duration-200">
