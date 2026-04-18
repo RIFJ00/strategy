@@ -1,11 +1,11 @@
 /**
  * 会議体ダッシュボード (リンク機能強化・最終版)
  * --------------------------------------------------
- * [修正内容]
- * 1. リンクの完全動作: 会議名クリックおよび操作列アイコンの両方で、どのURL形式でも開くよう修正。
- * 2. データ取得の堅牢化: Firestoreのキー名が「URL」「url」「ＵＲＬ」のどれでも認識。
- * 3. 手動修正の回次保存: 修正時「第N回」を自動抽出して保存。
- * 4. 分野順の固定: 登録順（createdAt）を常に維持。
+ * [修正ポイント]
+ * 1. リンクのクリック範囲を拡大し、z-indexを調整して確実に反応するように修正。
+ * 2. URLの取得ロジックを強化し、大文字・小文字・全角の「URL」に対応。
+ * 3. 回次（第N回）の自動抽出保存機能を維持。
+ * 4. 分野の登録順固定（createdAt順）を維持。
  */
 
 import React, { useState, useEffect, useRef, useMemo } from 'react';
@@ -36,15 +36,12 @@ const auth = getAuth(app);
 const db = getFirestore(app);
 const appId = 'seisakuresearch';
 
-// Firestore パスヘルパー
 const getMeetingsCol = () => collection(db, 'artifacts', appId, 'public', 'data', 'meetings');
 const getMeetingDoc = (id) => doc(db, 'artifacts', appId, 'public', 'data', 'meetings', id);
 const getSystemConfigDoc = () => doc(db, 'artifacts', appId, 'public', 'data', 'config', 'system');
 
-// 省庁建制順
 const MINISTRY_ORDER = ["内閣官房", "内閣府", "デジタル庁", "復興庁", "総務省", "法務省", "外務省", "財務省", "文部科学省", "厚生労働省", "農林水産省", "経済産業省", "国土交通省", "環境省", "原子力規制委員会", "防衛省"];
 
-// --- ユーティリティ ---
 const normalizeText = (str) => {
   if (!str) return "";
   return str.replace(/[！-～]/g, (s) => String.fromCharCode(s.charCodeAt(0) - 0xFEE0)).replace(/　/g, " ").replace(/\s+/g, " ").trim();
@@ -58,15 +55,12 @@ const parseDateToTs = (str) => {
     const match = s.match(dateRegex);
     if (!match) return 0;
     let year, month, day;
-    const full = match[0];
-    if (full.includes('令和')) {
-      const reiwa = full.match(/令和\s*?(\d+|元)年/)[1];
+    if (match[0].includes('令和')) {
+      const reiwa = match[0].match(/令和\s*?(\d+|元)年/)[1];
       year = reiwa === '元' ? 2019 : 2018 + parseInt(reiwa, 10);
-    } else {
-      year = parseInt(full.match(/(\d{4})年/)[1], 10);
-    }
-    month = parseInt(full.match(/(\d{1,2})月/)[1], 10) - 1;
-    day = parseInt(full.match(/(\d{1,2})日/)[1], 10);
+    } else { year = parseInt(match[0].match(/(\d{4})年/)[1], 10); }
+    month = parseInt(match[0].match(/(\d{1,2})月/)[1], 10) - 1;
+    day = parseInt(match[0].match(/(\d{1,2})日/)[1], 10);
     return new Date(year, month, day).getTime();
   } catch (e) { return 0; }
 };
@@ -87,18 +81,15 @@ const formatCheckTime = (ts) => {
   return date.toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 };
 
-// --- メインコンポーネント ---
 export default function App() {
   const [user, setUser] = useState(null);
   const [meetings, setMeetings] = useState([]);
   const [isAutoUpdateOn, setIsAutoUpdateOn] = useState(true);
   const [loading, setLoading] = useState(true);
-
   const [statusFilter, setStatusFilter] = useState('all');
   const [fieldFilter, setFieldFilter] = useState('all');
   const [agencyFilter, setAgencyFilter] = useState('all');
   const [searchQuery, setSearchQuery] = useState('');
-
   const [selectedIds, setSelectedIds] = useState(new Set());
   const [confirmingReadId, setConfirmingReadId] = useState(null); 
   const [editTarget, setEditTarget] = useState(null);
@@ -107,16 +98,13 @@ export default function App() {
   const [isClearingErrors, setIsClearingErrors] = useState(false);
   const [checkingId, setCheckingId] = useState(null); 
   const [statusMsg, setStatusMsg] = useState("");
-
   const [isBulkChecking, setIsBulkChecking] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
   const [bulkCheckProgress, setBulkCheckProgress] = useState({ current: 0, total: 0 });
   const [queue, setQueue] = useState([]);
   const [confirmBatchModal, setConfirmBatchModal] = useState(null);
-
   const wakeLockRef = useRef(null);
 
-  // 1. 統計情報
   const summary = useMemo(() => ({
     total: meetings.length,
     updated: meetings.filter(m => m.status === 'updated' && !m.isManual).length,
@@ -125,7 +113,6 @@ export default function App() {
     error: meetings.filter(m => m.status === 'error').length
   }), [meetings]);
 
-  // 2. Firebase 認証
   useEffect(() => {
     let isMounted = true;
     const unsubscribeAuth = onAuthStateChanged(auth, (u) => { if (isMounted) setUser(u); });
@@ -134,13 +121,12 @@ export default function App() {
         if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
           try { await signInWithCustomToken(auth, __initial_auth_token); } catch (e) { await signInAnonymously(auth); }
         } else if (!auth.currentUser) { await signInAnonymously(auth); }
-      } catch (e) { console.error("Auth Error:", e); }
+      } catch (e) { }
     };
     initAuth();
     return () => { isMounted = false; unsubscribeAuth(); };
   }, []);
 
-  // 3. リアルタイム同期
   useEffect(() => {
     if (!user) return;
     setLoading(true);
@@ -151,8 +137,8 @@ export default function App() {
       const data = snapshot.docs.map(doc => {
         const d = doc.data();
         const rawDateStr = d['直近開催日'] || d.latestDateString || '';
-        // URLの取得を柔軟にする（揺れ対策）
-        const url = d['URL'] || d['url'] || d['ＵＲＬ'] || '';
+        // 修正：URL取得を確実に
+        const url = (d['URL'] || d['url'] || d['ＵＲＬ'] || '').trim();
         
         return {
           id: doc.id,
@@ -177,7 +163,6 @@ export default function App() {
     return () => { unsubscribeConfig(); unsubscribeMeetings(); };
   }, [user]);
 
-  // 分野順の固定
   const uniqueFields = useMemo(() => {
     const sortedByRegistration = [...meetings].sort((a, b) => {
       const timeA = a.createdAt?.toMillis ? a.createdAt.toMillis() : (Number(a.createdAt) || 0);
@@ -191,7 +176,6 @@ export default function App() {
     return fields;
   }, [meetings]);
 
-  // ソート
   const sortedBaseList = useMemo(() => {
     return [...meetings].sort((a, b) => {
       const isUnreadA = a.status === 'updated'; const isUnreadB = b.status === 'updated';
@@ -222,17 +206,6 @@ export default function App() {
     });
   }, [sortedBaseList, statusFilter, fieldFilter, agencyFilter, searchQuery]);
 
-  const uniqueAgencies = useMemo(() => {
-    const agencies = Array.from(new Set(meetings.map(m => m.agency).filter(a => a && a !== '-')));
-    return agencies.sort((a, b) => {
-      const idxA = MINISTRY_ORDER.indexOf(a); const idxB = MINISTRY_ORDER.indexOf(b);
-      if (idxA !== -1 && idxB !== -1) return idxA - idxB;
-      if (idxA !== -1) return -1; if (idxB !== -1) return 1;
-      return a.localeCompare(b, 'ja');
-    });
-  }, [meetings]);
-
-  // --- 解析実行 ---
   const executeCheck = async (meeting) => {
     if (!meeting.url || !user) return;
     setCheckingId(meeting.id);
@@ -372,7 +345,7 @@ export default function App() {
     <div className="min-h-screen bg-gray-50 p-4 md:p-6 font-sans text-gray-900 leading-normal">
       <div className="max-w-7xl mx-auto space-y-4">
         
-        {/* Header Section */}
+        {/* Header */}
         <div className="flex flex-col md:flex-row md:items-center justify-between bg-white p-5 rounded-3xl shadow-sm border border-gray-100">
           <div className="flex flex-col md:flex-row md:items-center gap-6">
             <div>
@@ -414,7 +387,7 @@ export default function App() {
         <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
           <div className="relative group md:col-span-2"><Search className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" /><input type="text" placeholder="キーワード検索..." value={searchQuery} onChange={e => setSearchQuery(e.target.value)} className="w-full pl-10 pr-4 py-3 bg-white border border-gray-100 rounded-2xl shadow-sm text-sm font-bold focus:ring-2 focus:ring-indigo-50 outline-none" /></div>
           <div className="relative"><Filter className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" /><select value={fieldFilter} onChange={e => setFieldFilter(e.target.value)} className="w-full pl-10 pr-8 py-3 bg-white border border-gray-100 rounded-2xl appearance-none font-black text-gray-700 text-xs shadow-sm cursor-pointer outline-none"><option value="all">全ての分野</option>{uniqueFields.map(f => <option key={f} value={f}>{f}</option>)}</select></div>
-          <div className="relative"><MapPin className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" /><select value={agencyFilter} onChange={e => setAgencyFilter(e.target.value)} className="w-full pl-10 pr-8 py-3 bg-white border border-gray-100 rounded-2xl appearance-none font-black text-gray-700 text-xs shadow-sm cursor-pointer outline-none"><option value="all">全ての所管</option>{uniqueAgencies.map(a => <option key={a} value={a}>{a}</option>)}</select></div>
+          <div className="relative"><MapPin className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" /><select value={agencyFilter} onChange={e => setAgencyFilter(e.target.value)} className="w-full pl-10 pr-8 py-3 bg-white border border-gray-100 rounded-2xl appearance-none font-black text-gray-700 text-xs shadow-sm cursor-pointer outline-none"><option value="all">全ての所管</option>{Array.from(new Set(meetings.map(m => m.agency))).sort((a,b)=>a.localeCompare(b,'ja')).map(a => <option key={a} value={a}>{a}</option>)}</select></div>
         </div>
 
         {/* Main Table Area */}
@@ -449,8 +422,8 @@ export default function App() {
                         )}
                       </div>
                     </td>
-                    <td className="px-6 py-4 align-middle">
-                      {/* 会議体名リンク：z-indexとcursorを明確に指定 */}
+                    <td className="px-6 py-4 align-middle relative">
+                      {/* 修正：会議体名リンク（クリックを邪魔しないようrelative/z-index調整） */}
                       <div className="relative z-10">
                         {m.url ? (
                           <a 
@@ -458,7 +431,7 @@ export default function App() {
                             target="_blank" 
                             rel="noopener noreferrer" 
                             className="group/link inline-block cursor-pointer"
-                            title={m.url}
+                            onClick={(e) => e.stopPropagation()}
                           >
                             <div className="font-black text-gray-900 text-sm leading-tight line-clamp-1 group-hover/link:text-indigo-600 group-hover/link:underline transition-all">
                               {m.meetingName}
@@ -476,17 +449,18 @@ export default function App() {
                       </div>
                     </td>
                     <td className="px-6 py-4 align-middle text-center"><div className="flex flex-col items-center justify-center gap-0.5"><div className={`text-xs font-black ${m.status === 'updated' && !m.isManual ? 'text-red-600 animate-pulse' : 'text-gray-600'}`}>{m.latestDateString || '未定'}</div>{m.previousDateString && <div className="text-[10px] text-gray-400 font-bold opacity-70 line-through leading-none">{m.previousDateString}</div>}</div></td>
-                    <td className="px-8 py-4 align-middle text-right">
-                      {/* 操作列：リンクアイコン */}
-                      <div className="flex justify-end items-center gap-1.5 opacity-30 group-hover:opacity-100 transition-opacity">
+                    <td className="px-8 py-4 align-middle text-right relative">
+                      <div className="flex justify-end items-center gap-1.5 opacity-30 group-hover:opacity-100 transition-opacity relative z-10">
                         <button onClick={(e) => { e.stopPropagation(); executeCheck(m); }} disabled={checkingId === m.id || isBulkChecking} className="p-2 text-indigo-600 bg-white border border-indigo-50 rounded-xl hover:bg-indigo-600 hover:text-white transition-all shadow-sm active:scale-90 shadow-indigo-100">{checkingId === m.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <PlayCircle className="w-4 h-4" />}</button>
                         <button onClick={(e) => { e.stopPropagation(); setEditTarget(m); }} disabled={isBulkChecking} className="p-2 text-blue-600 bg-white border border-blue-50 rounded-xl hover:bg-blue-600 hover:text-white transition-all shadow-sm active:scale-90"><Edit3 className="w-4 h-4" /></button>
+                        {/* 修正：地球儀アイコンのリンク */}
                         {m.url && (
                           <a 
                             href={m.url} 
                             target="_blank" 
                             rel="noopener noreferrer" 
-                            className="p-2 text-gray-400 bg-white border border-gray-100 rounded-xl hover:text-indigo-600 transition-all shadow-sm cursor-pointer"
+                            className="p-2 text-gray-400 bg-white border border-gray-100 rounded-xl hover:text-indigo-600 transition-all shadow-sm cursor-pointer inline-flex items-center"
+                            onClick={(e) => e.stopPropagation()}
                           >
                             <ExternalLink className="w-4 h-4" />
                           </a>
