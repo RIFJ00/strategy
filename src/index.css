@@ -1,9 +1,1 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
-3. その後、いつものようにターミナルで `App.jsx` と一緒に GitHub へ送信（プッシュ）します。
-```bash
-git add .
-git commit -m "手動チェック追加とデザインの修正"
-git push origin main
-これで、Vercel上でもこのプレビューと全く同じ、リッチなデザインが表示されるようになります！
+@import "tailwindcss";
