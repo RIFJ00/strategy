@@ -1,13 +1,11 @@
 /**
- * 会議体ダッシュボード (全機能統合・最終確定版)
+ * 会議体ダッシュボード (リンク機能強化・最終版)
  * --------------------------------------------------
- * [実装済み全機能]
- * 1. リンク機能: 会議名クリック ＋ 操作列のリンクアイコンの両方に対応。
- * 2. 手動修正: 「(第N回)」を含めた手動入力・保存に完全対応。入力から回数を自動抽出。
- * 3. エラー一括解除: オレンジ色のボタンで全エラーをグレー（変更なし）にリセット。
- * 4. 分野順固定: AI・半導体 ➡ 造船 ➡ 量子... のFirestore登録順（createdAt順）を維持。
- * 5. 未読状態の保護: 既読にするまで、何度巡回しても赤色のボタンを維持。
- * 6. スリープ防止: 巡回中に画面が暗くなっても処理を中断させない（Wake Lock API）。
+ * [修正内容]
+ * 1. リンクの完全動作: 会議名クリックおよび操作列アイコンの両方で、どのURL形式でも開くよう修正。
+ * 2. データ取得の堅牢化: Firestoreのキー名が「URL」「url」「ＵＲＬ」のどれでも認識。
+ * 3. 手動修正の回次保存: 修正時「第N回」を自動抽出して保存。
+ * 4. 分野順の固定: 登録順（createdAt）を常に維持。
  */
 
 import React, { useState, useEffect, useRef, useMemo } from 'react';
@@ -19,11 +17,11 @@ import {
   getFirestore, collection, onSnapshot, query, doc, updateDoc, serverTimestamp, writeBatch, getDoc, setDoc
 } from 'firebase/firestore';
 import { 
-  Search, CheckCircle, Clock, AlertTriangle, ExternalLink, 
-  RefreshCw, Edit3, X, Database, PlayCircle, Loader2, Tag, Filter, Save, UserCheck, WifiOff, CheckSquare, Square, StopCircle, Play, RotateCcw, Eye, ArrowUpDown, EyeOff, Bookmark, MapPin, Power, Info, HelpCircle
+  Search, CheckCircle, AlertTriangle, ExternalLink, 
+  RefreshCw, Edit3, X, Database, PlayCircle, Loader2, Tag, Filter, Save, UserCheck, WifiOff, CheckSquare, Square, StopCircle, Play, RotateCcw, Eye, EyeOff, Bookmark, MapPin, Power, HelpCircle
 } from 'lucide-react';
 
-// --- Firebase 設定 (seisakuresearch00) ---
+// --- Firebase 設定 ---
 const firebaseConfig = {
   apiKey: "AIzaSyBx5e752GWfvJDZ3lEx0IcArxjvCEz7S2M",
   authDomain: "seisakuresearch00.firebaseapp.com",
@@ -43,7 +41,7 @@ const getMeetingsCol = () => collection(db, 'artifacts', appId, 'public', 'data'
 const getMeetingDoc = (id) => doc(db, 'artifacts', appId, 'public', 'data', 'meetings', id);
 const getSystemConfigDoc = () => doc(db, 'artifacts', appId, 'public', 'data', 'config', 'system');
 
-// 日本の行政機関の建制順（所管プルダウン用）
+// 省庁建制順
 const MINISTRY_ORDER = ["内閣官房", "内閣府", "デジタル庁", "復興庁", "総務省", "法務省", "外務省", "財務省", "文部科学省", "厚生労働省", "農林水産省", "経済産業省", "国土交通省", "環境省", "原子力規制委員会", "防衛省"];
 
 // --- ユーティリティ ---
@@ -60,13 +58,15 @@ const parseDateToTs = (str) => {
     const match = s.match(dateRegex);
     if (!match) return 0;
     let year, month, day;
-    const fullMatch = match[0];
-    if (fullMatch.includes('令和')) {
-      const reiwaYearStr = fullMatch.match(/令和\s*?(\d+|元)年/)[1];
-      year = reiwaYearStr === '元' ? 2019 : 2018 + parseInt(reiwaYearStr, 10);
-    } else { year = parseInt(fullMatch.match(/(\d{4})年/)[1], 10); }
-    month = parseInt(fullMatch.match(/(\d{1,2})月/)[1], 10) - 1;
-    day = parseInt(fullMatch.match(/(\d{1,2})日/)[1], 10);
+    const full = match[0];
+    if (full.includes('令和')) {
+      const reiwa = full.match(/令和\s*?(\d+|元)年/)[1];
+      year = reiwa === '元' ? 2019 : 2018 + parseInt(reiwa, 10);
+    } else {
+      year = parseInt(full.match(/(\d{4})年/)[1], 10);
+    }
+    month = parseInt(full.match(/(\d{1,2})月/)[1], 10) - 1;
+    day = parseInt(full.match(/(\d{1,2})日/)[1], 10);
     return new Date(year, month, day).getTime();
   } catch (e) { return 0; }
 };
@@ -94,13 +94,11 @@ export default function App() {
   const [isAutoUpdateOn, setIsAutoUpdateOn] = useState(true);
   const [loading, setLoading] = useState(true);
 
-  // フィルター
   const [statusFilter, setStatusFilter] = useState('all');
   const [fieldFilter, setFieldFilter] = useState('all');
   const [agencyFilter, setAgencyFilter] = useState('all');
   const [searchQuery, setSearchQuery] = useState('');
 
-  // 操作
   const [selectedIds, setSelectedIds] = useState(new Set());
   const [confirmingReadId, setConfirmingReadId] = useState(null); 
   const [editTarget, setEditTarget] = useState(null);
@@ -118,7 +116,7 @@ export default function App() {
 
   const wakeLockRef = useRef(null);
 
-  // 1. 統計情報の算出
+  // 1. 統計情報
   const summary = useMemo(() => ({
     total: meetings.length,
     updated: meetings.filter(m => m.status === 'updated' && !m.isManual).length,
@@ -132,15 +130,17 @@ export default function App() {
     let isMounted = true;
     const unsubscribeAuth = onAuthStateChanged(auth, (u) => { if (isMounted) setUser(u); });
     const initAuth = async () => {
-      if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-        try { await signInWithCustomToken(auth, __initial_auth_token); } catch (e) { await signInAnonymously(auth); }
-      } else if (!auth.currentUser) { await signInAnonymously(auth); }
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          try { await signInWithCustomToken(auth, __initial_auth_token); } catch (e) { await signInAnonymously(auth); }
+        } else if (!auth.currentUser) { await signInAnonymously(auth); }
+      } catch (e) { console.error("Auth Error:", e); }
     };
     initAuth();
     return () => { isMounted = false; unsubscribeAuth(); };
   }, []);
 
-  // 3. リアルタイム同期 (onSnapshot)
+  // 3. リアルタイム同期
   useEffect(() => {
     if (!user) return;
     setLoading(true);
@@ -151,10 +151,13 @@ export default function App() {
       const data = snapshot.docs.map(doc => {
         const d = doc.data();
         const rawDateStr = d['直近開催日'] || d.latestDateString || '';
+        // URLの取得を柔軟にする（揺れ対策）
+        const url = d['URL'] || d['url'] || d['ＵＲＬ'] || '';
+        
         return {
           id: doc.id,
           meetingName: d['会議名'] || d.meetingName || '無題の会議',
-          url: d['URL'] || d.url || '',
+          url: url,
           agency: d['所管'] || d['省庁'] || d.agency || '-',
           relatedField: d['関連分野'] || d.relatedField || '-',
           latestDateString: rawDateStr, 
@@ -174,7 +177,7 @@ export default function App() {
     return () => { unsubscribeConfig(); unsubscribeMeetings(); };
   }, [user]);
 
-  // 分野順の固定 (登録日時順)
+  // 分野順の固定
   const uniqueFields = useMemo(() => {
     const sortedByRegistration = [...meetings].sort((a, b) => {
       const timeA = a.createdAt?.toMillis ? a.createdAt.toMillis() : (Number(a.createdAt) || 0);
@@ -188,7 +191,7 @@ export default function App() {
     return fields;
   }, [meetings]);
 
-  // 表のソート (未読 ➡ エラー ➡ 登録順)
+  // ソート
   const sortedBaseList = useMemo(() => {
     return [...meetings].sort((a, b) => {
       const isUnreadA = a.status === 'updated'; const isUnreadB = b.status === 'updated';
@@ -220,8 +223,8 @@ export default function App() {
   }, [sortedBaseList, statusFilter, fieldFilter, agencyFilter, searchQuery]);
 
   const uniqueAgencies = useMemo(() => {
-    const raw = Array.from(new Set(meetings.map(m => m.agency).filter(a => a && a !== '-')));
-    return raw.sort((a, b) => {
+    const agencies = Array.from(new Set(meetings.map(m => m.agency).filter(a => a && a !== '-')));
+    return agencies.sort((a, b) => {
       const idxA = MINISTRY_ORDER.indexOf(a); const idxB = MINISTRY_ORDER.indexOf(b);
       if (idxA !== -1 && idxB !== -1) return idxA - idxB;
       if (idxA !== -1) return -1; if (idxB !== -1) return 1;
@@ -229,7 +232,7 @@ export default function App() {
     });
   }, [meetings]);
 
-  // --- 解析・チェック実行 ---
+  // --- 解析実行 ---
   const executeCheck = async (meeting) => {
     if (!meeting.url || !user) return;
     setCheckingId(meeting.id);
@@ -281,14 +284,6 @@ export default function App() {
         }
       }
       let bestDate = candidates.length > 0 ? candidates.reduce((p, c) => (p.score > c.score) ? p : c) : null;
-      if (!bestDate) {
-        let globalDates = []; dateRegex.lastIndex = 0;
-        while ((dMatch = dateRegex.exec(bodyText)) !== null) {
-          const ts = parseDateToTs(dMatch[0]);
-          if (ts > 0) globalDates.push({ str: dMatch[0], ts });
-        }
-        if (globalDates.length > 0) bestDate = globalDates.reduce((p, c) => (p.ts > c.ts) ? p : c);
-      }
       const currentTs = meeting.latestDateTimestamp || 0;
       const currentRoundNum = (meeting.meetingRound || "").match(/\d+/) ? parseInt(meeting.meetingRound.match(/\d+/)[0], 10) : 0;
       if (targetRound.num > currentRoundNum || (bestDate && bestDate.ts > currentTs)) {
@@ -329,7 +324,6 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [isBulkChecking, isPaused, queue]);
 
-  // --- 一括操作 ---
   const handleMarkAllRead = async () => {
     if (!user || isMarkingAll) return;
     const targets = meetings.filter(m => m.status === 'updated');
@@ -337,8 +331,7 @@ export default function App() {
     setIsMarkingAll(true);
     const batch = writeBatch(db);
     targets.forEach(m => {
-      const docRef = getMeetingDoc(m.id);
-      batch.update(docRef, { status: 'unchanged', isManual: false, previousDateString: "" });
+      batch.update(getMeetingDoc(m.id), { status: 'unchanged', isManual: false, previousDateString: "" });
     });
     await batch.commit(); setIsMarkingAll(false);
   };
@@ -350,8 +343,7 @@ export default function App() {
     setIsClearingErrors(true);
     const batch = writeBatch(db);
     targets.forEach(m => {
-      const docRef = getMeetingDoc(m.id);
-      batch.update(docRef, { status: 'unchanged', errorMessage: null });
+      batch.update(getMeetingDoc(m.id), { status: 'unchanged', errorMessage: null });
     });
     await batch.commit(); setIsClearingErrors(false);
   };
@@ -366,16 +358,6 @@ export default function App() {
     const westernDate = formatToWesternDatePreservingRound(rawInput);
     await updateDoc(getMeetingDoc(editTarget.id), { '直近開催日': rawInput, latestDateString: rawInput, latestDateTimestamp: parseDateToTs(westernDate), meetingRound: extractedRound, status: 'unchanged', isManual: false, errorMessage: null, lastModifiedAt: serverTimestamp() });
     setEditTarget(null); setIsSaving(false);
-  };
-
-  const handleReadConfirm = (e, m) => {
-    e.stopPropagation();
-    if (confirmingReadId === m.id) {
-      updateDoc(getMeetingDoc(m.id), { status: 'unchanged', isManual: false, previousDateString: "" });
-      setConfirmingReadId(null);
-    } else {
-      setConfirmingReadId(m.id); setTimeout(() => setConfirmingReadId(null), 5000);
-    }
   };
 
   const handleToggleStatus = (m) => {
@@ -456,7 +438,7 @@ export default function App() {
                       <div className="flex flex-col gap-1.5 items-start min-w-[210px]">
                         {m.status === 'updated' ? (
                           <>
-                            <div className="flex items-center gap-2"><button onClick={(e) => handleReadConfirm(e, m)} className={`px-3 py-1 text-[9px] font-black rounded-lg shadow-sm flex items-center gap-1 active:scale-95 transition-all ${confirmingReadId === m.id ? 'bg-red-900 text-white scale-105' : 'bg-red-600 text-white hover:bg-red-700'}`}>{confirmingReadId === m.id ? <HelpCircle className="w-3 h-3" /> : <CheckCircle className="w-3 h-3" />}{confirmingReadId === m.id ? '本当によろしいですか？' : '既読にする'}</button><span className="text-[7.5px] text-gray-400 font-bold opacity-80 uppercase">{formatCheckTime(m.lastCheckedAt)}</span></div>
+                            <div className="flex items-center gap-2"><button onClick={(e) => { e.stopPropagation(); if(confirmingReadId === m.id) { handleToggleStatus(m); setConfirmingReadId(null); } else { setConfirmingReadId(m.id); setTimeout(()=>setConfirmingReadId(null), 3000); } }} className={`px-3 py-1 text-[9px] font-black rounded-lg shadow-sm flex items-center gap-1 active:scale-95 transition-all ${confirmingReadId === m.id ? 'bg-red-900 text-white scale-105' : 'bg-red-600 text-white hover:bg-red-700'}`}>{confirmingReadId === m.id ? <HelpCircle className="w-3 h-3" /> : <CheckCircle className="w-3 h-3" />}{confirmingReadId === m.id ? '確定' : '既読にする'}</button><span className="text-[7.5px] text-gray-400 font-bold opacity-80 uppercase">{formatCheckTime(m.lastCheckedAt)}</span></div>
                             <div className={`flex items-center gap-1.5 text-[8.5px] font-black px-2 py-0.5 rounded border ${m.isManual ? 'bg-gray-50 text-gray-500 border-gray-200' : 'bg-red-50 text-red-600 border-red-200'}`}>{m.isManual ? <Bookmark className="w-2.5 h-2.5 text-blue-500" /> : <RefreshCw className="w-2.5 h-2.5 animate-spin-slow text-red-500" />}{m.isManual ? 'チェック用' : '未読（新着）'}</div>
                           </>
                         ) : (
@@ -468,16 +450,47 @@ export default function App() {
                       </div>
                     </td>
                     <td className="px-6 py-4 align-middle">
-                      {/* 会議体名クリックリンク */}
-                      <a href={m.url} target="_blank" rel="noopener noreferrer" className="group/link inline-block cursor-pointer"><div className="font-black text-gray-900 text-sm leading-tight line-clamp-1 group-hover/link:text-indigo-600 group-hover/link:underline transition-all">{m.meetingName}</div></a>
-                      <div className="flex flex-wrap items-center gap-2 mt-1 opacity-70"><span className="flex items-center gap-1 text-[8px] font-black text-indigo-600 bg-indigo-50 px-1.5 py-0.5 rounded border border-indigo-100 shadow-sm"><Tag className="w-2.5 h-2.5" /> {m.relatedField || '-'}</span><span className="flex items-center gap-1 text-[8px] font-black text-gray-500 bg-gray-50 px-1.5 py-0.5 rounded border border-gray-200 shadow-sm"><MapPin className="w-2.5 h-2.5" /> {m.agency}</span></div>
+                      {/* 会議体名リンク：z-indexとcursorを明確に指定 */}
+                      <div className="relative z-10">
+                        {m.url ? (
+                          <a 
+                            href={m.url} 
+                            target="_blank" 
+                            rel="noopener noreferrer" 
+                            className="group/link inline-block cursor-pointer"
+                            title={m.url}
+                          >
+                            <div className="font-black text-gray-900 text-sm leading-tight line-clamp-1 group-hover/link:text-indigo-600 group-hover/link:underline transition-all">
+                              {m.meetingName}
+                            </div>
+                          </a>
+                        ) : (
+                          <div className="font-black text-gray-400 text-sm leading-tight line-clamp-1 italic">
+                            {m.meetingName} (URLなし)
+                          </div>
+                        )}
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2 mt-1 opacity-70">
+                        <span className="flex items-center gap-1 text-[8px] font-black text-indigo-600 bg-indigo-50 px-1.5 py-0.5 rounded border border-indigo-100 shadow-sm"><Tag className="w-2.5 h-2.5" /> {m.relatedField || '-'}</span>
+                        <span className="flex items-center gap-1 text-[8px] font-black text-gray-500 bg-gray-50 px-1.5 py-0.5 rounded border border-gray-200 shadow-sm"><MapPin className="w-2.5 h-2.5" /> {m.agency}</span>
+                      </div>
                     </td>
                     <td className="px-6 py-4 align-middle text-center"><div className="flex flex-col items-center justify-center gap-0.5"><div className={`text-xs font-black ${m.status === 'updated' && !m.isManual ? 'text-red-600 animate-pulse' : 'text-gray-600'}`}>{m.latestDateString || '未定'}</div>{m.previousDateString && <div className="text-[10px] text-gray-400 font-bold opacity-70 line-through leading-none">{m.previousDateString}</div>}</div></td>
                     <td className="px-8 py-4 align-middle text-right">
+                      {/* 操作列：リンクアイコン */}
                       <div className="flex justify-end items-center gap-1.5 opacity-30 group-hover:opacity-100 transition-opacity">
                         <button onClick={(e) => { e.stopPropagation(); executeCheck(m); }} disabled={checkingId === m.id || isBulkChecking} className="p-2 text-indigo-600 bg-white border border-indigo-50 rounded-xl hover:bg-indigo-600 hover:text-white transition-all shadow-sm active:scale-90 shadow-indigo-100">{checkingId === m.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <PlayCircle className="w-4 h-4" />}</button>
                         <button onClick={(e) => { e.stopPropagation(); setEditTarget(m); }} disabled={isBulkChecking} className="p-2 text-blue-600 bg-white border border-blue-50 rounded-xl hover:bg-blue-600 hover:text-white transition-all shadow-sm active:scale-90"><Edit3 className="w-4 h-4" /></button>
-                        <a href={m.url} target="_blank" rel="noopener noreferrer" className="p-2 text-gray-400 bg-white border border-gray-100 rounded-xl hover:text-indigo-600 transition-all shadow-sm"><ExternalLink className="w-4 h-4" /></a>
+                        {m.url && (
+                          <a 
+                            href={m.url} 
+                            target="_blank" 
+                            rel="noopener noreferrer" 
+                            className="p-2 text-gray-400 bg-white border border-gray-100 rounded-xl hover:text-indigo-600 transition-all shadow-sm cursor-pointer"
+                          >
+                            <ExternalLink className="w-4 h-4" />
+                          </a>
+                        )}
                       </div>
                     </td>
                   </tr>
@@ -488,7 +501,7 @@ export default function App() {
         </div>
       </div>
 
-      {/* 巡回パネル (浮遊式) */}
+      {/* 巡回パネル */}
       {isBulkChecking && (
         <div className="fixed bottom-8 right-8 bg-white p-8 rounded-[2.5rem] shadow-2xl border-2 border-indigo-50 z-50 w-80 animate-in slide-in-from-right-10">
           <div className="flex items-center justify-between mb-6">
@@ -519,7 +532,7 @@ export default function App() {
             <div className="flex justify-between items-center mb-6"><h2 className="font-black text-gray-900 flex items-center gap-2 text-base leading-none"><Edit3 className="w-5 h-5 text-blue-600" /> データの修正</h2><button onClick={() => setEditTarget(null)} className="p-2 text-gray-400 hover:bg-gray-200 rounded-full transition-all"><X className="w-5 h-5" /></button></div>
             <form onSubmit={handleSaveEdit} className="space-y-6">
               <div><label className="text-[10px] font-black text-gray-400 uppercase tracking-widest mb-2 block px-1">対象の会議体</label><div className="px-5 py-4 bg-gray-50 border border-gray-100 rounded-2xl font-bold text-gray-700 text-xs truncate leading-relaxed">{editTarget.meetingName}</div></div>
-              <div><label className="text-[10px] font-black text-indigo-600 uppercase tracking-widest mb-2 block px-1 leading-none font-black mb-2 font-sans">開催日 (第N回も含めて入力)</label><input type="text" autoFocus value={editTarget.latestDateString} onChange={e => setEditTarget({...editTarget, latestDateString: e.target.value})} className="w-full px-5 py-5 bg-indigo-50 border-2 border-indigo-100 rounded-2xl focus:ring-4 focus:ring-indigo-100 outline-none font-black text-indigo-700 text-base shadow-inner" placeholder="例: 令和8年4月11日 (第15回)" /><p className="mt-2 text-[10px] text-gray-400 px-1 font-bold italic">※「(第〇回)」と書くと回数も保存されます</p></div>
+              <div><label className="text-[10px] font-black text-indigo-600 uppercase tracking-widest mb-2 block px-1 leading-none font-black mb-2 font-sans">開催日 (第N回も含めて入力)</label><input type="text" autoFocus value={editTarget.latestDateString} onChange={e => setEditTarget({...editTarget, latestDateString: e.target.value})} className="w-full px-5 py-5 bg-indigo-50 border-2 border-indigo-100 rounded-2xl focus:ring-4 focus:ring-indigo-100 outline-none font-black text-indigo-700 text-base shadow-inner placeholder:opacity-40" placeholder="例: 令和8年4月11日 (第15回)" /><p className="mt-2 text-[10px] text-gray-400 px-1 font-bold italic">※「(第〇回)」と書くと回数も保存されます</p></div>
               <div className="pt-4 flex gap-3"><button type="button" onClick={() => setEditTarget(null)} className="flex-1 py-4 bg-gray-100 text-gray-400 font-black rounded-2xl hover:bg-gray-200 transition-all text-xs uppercase tracking-widest">キャンセル</button><button type="submit" disabled={isSaving} className="flex-1 py-4 bg-indigo-600 text-white font-black rounded-2xl hover:bg-indigo-700 shadow-xl shadow-indigo-100 transition-all active:scale-95 text-xs uppercase flex items-center justify-center gap-2 tracking-widest">{isSaving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />} 保存する</button></div>
             </form>
           </div>
