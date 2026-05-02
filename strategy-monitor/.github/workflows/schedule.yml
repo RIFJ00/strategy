@@ -1,0 +1,31 @@
+name: Meeting Checker Cron Job
+
+on:
+  schedule:
+    # 毎日 日本時間の朝8:00 (UTC 23:00)
+    - cron: '0 23 * * *'
+  workflow_dispatch: # ボタンを押して今すぐ実行できるようにする設定
+
+jobs:
+  check-updates:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: リポジトリのチェックアウト
+        uses: actions/checkout@v4
+
+      - name: Node.jsのセットアップ
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20' # 安定版の20番を使用します
+
+      - name: 依存関係のインストール
+        # npm install で package.json に書かれたライブラリ（axios, cheerioなど）を入れます
+        run: npm install
+
+      - name: チェック用スクリプトの実行
+        env:
+          # GitHubのSecretsに登録した秘密鍵とSlackURLをプログラムに渡します
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: node checker-backend.js
