@@ -1,14 +1,16 @@
 /**
- * バックエンド (高精度近接スキャン・最終確定版)
+ * バックエンド (高精度近接スキャン・画面連動・ESM対応版)
  * [役割]
  * 1. GitHub Actions で定期実行され、官公庁サイトを巡回。
- * 2. 「第N回」の記述を見つけ、その周辺テキストから開催日を特定。
- * 3. 更新があれば Firestore を直接書き換え、Slack に通知。
+ * 2. 画面上の『Daily Auto Update』スイッチがオフの場合は自動でスキップ。
+ * 3. 「第N回」の記述を見つけ、その周辺テキストから開催日を特定。
+ * 4. 更新があれば Firestore を直接書き換え、Slack に通知。
  */
 
-const axios = require('axios');
-const cheerio = require('cheerio');
-const admin = require('firebase-admin');
+// ❌ require から ⭕️ ESM形式 (import) に修正
+import axios from 'axios';
+import * as cheerio from 'cheerio';
+import admin from 'firebase-admin';
 
 // 環境変数から設定を読み込み
 const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL;
@@ -28,7 +30,6 @@ if (!admin.apps.length) {
 }
 
 const db = admin.firestore();
-// Firestore のパスをフロントエンドと完全に一致させる
 const meetingsCol = db.collection('artifacts').doc(appId).collection('public').doc('data').collection('meetings');
 
 // 日付と回次を探すための正規表現
@@ -36,7 +37,7 @@ const dateRegex = /(20\d{2}|令和\s*?\d+|令和\s*?元)年\s*?(\d{1,2})月\s*?(
 const roundRegex = /第\s*?([0-9０-９]+|元)\s*?回/g;
 
 /**
- * テキストの正規化（全角英数を半角にする、余計な空白を消す）
+ * テキストの正規化
  */
 const normalizeText = (str) => {
   if (!str) return "";
@@ -86,6 +87,23 @@ async function notifySlack(name, combinedDate, url) {
  * メインの巡回処理
  */
 async function runCheck() {
+  console.log("自動巡回システムを起動しました。");
+
+  // 🌟【最重要追加】画面上の「Daily Auto Update」のオン・オフ状態を確認する
+  try {
+    const configDoc = await db.collection('artifacts').doc(appId).collection('public').doc('data').collection('config').doc('system').get();
+    if (configDoc.exists) {
+      const configData = configDoc.data();
+      // フロントエンドのトグルが false (DISABLED) の場合
+      if (configData.autoUpdateEnabled === false) {
+        console.log("⚠️ 【判定】画面上で『Daily Auto Update』がオフに設定されているため、今回の巡回処理を安全にスキップします。");
+        return; // ここで処理を終了（緑色のSuccessになります）
+      }
+    }
+  } catch (configError) {
+    console.log("設定確認中にエラーが発生しました（巡回は続行します）:", configError.message);
+  }
+
   const snapshot = await meetingsCol.get();
   console.log(`開始: ${snapshot.size} 件の会議体をチェックします...`);
 
@@ -97,7 +115,6 @@ async function runCheck() {
     if (!url || !rawName) continue;
 
     try {
-      // キャッシュ回避のためタイムスタンプを付与
       const response = await axios.get(`${url}${url.includes('?') ? '&' : '?'}t=${Date.now()}`, { 
         timeout: 30000,
         headers: { 'User-Agent': 'Mozilla/5.0' } 
@@ -107,7 +124,6 @@ async function runCheck() {
       $('script, style, noscript').remove();
       const bodyText = normalizeText($('body').text());
 
-      // 1. 全ての回次（第N回）を特定
       let rounds = [];
       let rMatch;
       roundRegex.lastIndex = 0;
@@ -117,22 +133,19 @@ async function runCheck() {
       }
 
       if (rounds.length > 0) {
-        // 最大の回数をターゲットにする
         const targetRound = rounds.reduce((p, c) => (p.num > c.num) ? p : c);
 
-        // 2. ターゲット回次の周辺テキストを切り出し（近接スキャン）
         const start = Math.max(0, targetRound.index - 200);
         const end = Math.min(bodyText.length, targetRound.index + 400);
         const focusSnippet = bodyText.substring(start, end);
 
-        // 3. 切り出した範囲から日付を抽出・スコアリング
         let candidates = [];
         let dMatch;
         dateRegex.lastIndex = 0;
         while ((dMatch = dateRegex.exec(focusSnippet)) !== null) {
           const ts = parseDateToTs(dMatch[0]);
           if (ts > 0) {
-            const dist = Math.abs(dMatch.index - 200); // 中央（回次位置）からの距離
+            const dist = Math.abs(dMatch.index - 200);
             const context = focusSnippet.substring(Math.max(0, dMatch.index - 60), dMatch.index + 60);
             const bonus = /開催|案内|日時|次第|資料|予定/.test(context) ? 100000 : 0;
             const penalty = /更新|作成|公開|最終|Last/.test(context) ? 80000 : 0;
@@ -146,7 +159,6 @@ async function runCheck() {
         const currentRoundNum = meeting.meetingRound ? 
           (meeting.meetingRound.match(/\d+/) ? parseInt(meeting.meetingRound.match(/\d+/)[0], 10) : 0) : 0;
 
-        // 4. 更新判定（回数が増えているか、日付が新しいか）
         if (targetRound.num > currentRoundNum || (bestDate && bestDate.ts > currentTs)) {
           const finalDate = bestDate ? bestDate.str : (meeting.latestDateString || "日付不明");
           const combinedStr = `${finalDate} (${targetRound.str})`;
@@ -165,7 +177,6 @@ async function runCheck() {
           console.log(`✨ 更新検知: ${rawName} -> ${combinedStr}`);
           await notifySlack(rawName, combinedStr, url);
         } else {
-          // 変更がなくても巡回時刻だけ更新
           await doc.ref.update({ lastCheckedAt: admin.firestore.FieldValue.serverTimestamp() });
         }
       }
@@ -173,11 +184,9 @@ async function runCheck() {
       console.error(`[エラー] ${rawName}:`, e.message);
     }
 
-    // サーバー負荷軽減のため待機
     await new Promise(r => setTimeout(r, 1000));
   }
   console.log('完了: すべての巡回が終了しました。');
 }
 
-// 実行
 runCheck();
