@@ -7,7 +7,6 @@
  * 4. 更新があれば Firestore を直接書き換え、Slack に通知。
  */
 
-// ❌ require から ⭕️ ESM形式 (import) に修正
 import axios from 'axios';
 import * as cheerio from 'cheerio';
 import admin from 'firebase-admin';
@@ -87,9 +86,12 @@ async function notifySlack(name, combinedDate, url) {
  * メインの巡回処理
  */
 async function runCheck() {
-  console.log("自動巡回システムを起動しました。");
+  // 🌟【確認用目印ログ】
+  console.log("==================================================");
+  console.log("★★★ 画面連動版バックエンド (最新版) が起動しました ★★★");
+  console.log("==================================================");
 
-  // 🌟【最重要追加】画面上の「Daily Auto Update」のオン・オフ状態を確認する
+  // 🌟 画面上の「Daily Auto Update」のオン・オフ状態を確認する
   try {
     const configDoc = await db.collection('artifacts').doc(appId).collection('public').doc('data').collection('config').doc('system').get();
     if (configDoc.exists) {
