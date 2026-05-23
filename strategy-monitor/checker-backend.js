@@ -1,194 +1,542 @@
-/**
- * バックエンド (高精度近接スキャン・画面連動・ESM対応版)
- * [役割]
- * 1. GitHub Actions で定期実行され、官公庁サイトを巡回。
- * 2. 画面上の『Daily Auto Update』スイッチがオフの場合は自動でスキップ。
- * 3. 「第N回」の記述を見つけ、その周辺テキストから開催日を特定。
- * 4. 更新があれば Firestore を直接書き換え、Slack に通知。
- */
+const { onRequest, onCall, HttpsError } = require("firebase-functions/v2/https");
+const { onSchedule } = require("firebase-functions/v2/scheduler");
+const { setGlobalOptions } = require("firebase-functions/v2");
+const admin = require("firebase-admin");
+const axios = require("axios");
+const cheerio = require("cheerio"); 
+const crypto = require("crypto"); 
+const { GoogleGenerativeAI } = require("@google/generative-ai"); 
 
-import axios from 'axios';
-import * as cheerio from 'cheerio';
-import admin from 'firebase-admin';
-
-// 環境変数から設定を読み込み
-const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL;
-const FIREBASE_KEY_JSON = process.env.FIREBASE_SERVICE_ACCOUNT;
-const appId = 'seisakuresearch'; 
-
-// Firebase の初期化
-if (!FIREBASE_KEY_JSON) {
-  console.error('エラー: FIREBASE_SERVICE_ACCOUNT が設定されていません。');
-  process.exit(1);
-}
-
-if (!admin.apps.length) {
-  admin.initializeApp({
-    credential: admin.credential.cert(JSON.parse(FIREBASE_KEY_JSON))
-  });
-}
-
+if (admin.apps.length === 0) admin.initializeApp();
 const db = admin.firestore();
-const meetingsCol = db.collection('artifacts').doc(appId).collection('public').doc('data').collection('meetings');
 
-// 日付と回次を探すための正規表現
-const dateRegex = /(20\d{2}|令和\s*?\d+|令和\s*?元)年\s*?(\d{1,2})月\s*?(\d{1,2})日/g;
-const roundRegex = /第\s*?([0-9０-９]+|元)\s*?回/g;
+// 同時処理の上限を解放
+setGlobalOptions({ maxInstances: 200 });
 
 /**
- * テキストの正規化
+ * 1. 司令塔（Orchestrator） - 定期実行スケジュール監視
  */
-const normalizeText = (str) => {
-  if (!str) return "";
-  return str
-    .replace(/[！-～]/g, (s) => String.fromCharCode(s.charCodeAt(0) - 0xFEE0))
-    .replace(/　/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-};
-
 /**
- * 日本語の日付文字列をタイムスタンプに変換
+ * 1. 司令塔（Orchestrator） - 定期実行スケジュール監視
+ * 🌟画面の『Daily Auto Update』がオフ（DISABLED）の時は、安全にスキップするように修正
  */
-const parseDateToTs = (str) => {
+exports.automaticDailyCheckSchedule = onSchedule({
+  schedule: "every 5 minutes",
+  timeZone: "Asia/Tokyo",
+  memory: "2GiB",
+  timeoutSeconds: 1800
+}, async (event) => {
+  let shouldTrigger = false;
+  let runKeyToSave = "";
+
+  // 🔒【最重要追加】まずは画面上のトグルが「オフ」になっていないか最優先でチェック
   try {
-    const s = normalizeText(str);
-    const match = s.match(/(20\d{2}|令和\d+|令和元)年(\d{1,2})月(\d{1,2})日/);
-    if (!match) return 0;
-    let year;
-    if (match[0].includes('令和')) {
-      const rYear = match[0].match(/令和(\d+|元)年/)[1];
-      year = rYear === '元' ? 2019 : 2018 + parseInt(rYear, 10);
-    } else {
-      year = parseInt(match[0].match(/(\d{4})年/)[1], 10);
-    }
-    const month = parseInt(match[0].match(/(\d{1,2})月/)[1], 10) - 1;
-    const day = parseInt(match[0].match(/(\d{1,2})日/)[1], 10);
-    return new Date(year, month, day).getTime();
-  } catch (e) { return 0; }
-};
-
-/**
- * Slack への通知
- */
-async function notifySlack(name, combinedDate, url) {
-  if (!SLACK_WEBHOOK_URL) return;
-  try {
-    await axios.post(SLACK_WEBHOOK_URL, {
-      text: `🔔 *更新検知*: ${name}\n📅 日時: ${combinedDate}\n🔗 URL: ${url}`
-    });
-  } catch (e) {
-    console.error('Slack通知失敗:', e.message);
-  }
-}
-
-/**
- * メインの巡回処理
- */
-async function runCheck() {
-  // 🌟【確認用目印ログ】
-  console.log("==================================================");
-  console.log("★★★ 画面連動版バックエンド (最新版) が起動しました ★★★");
-  console.log("==================================================");
-
-  // 🌟 画面上の「Daily Auto Update」のオン・オフ状態を確認する
-  try {
-    const configDoc = await db.collection('artifacts').doc(appId).collection('public').doc('data').collection('config').doc('system').get();
+    const systemConfigRef = db.doc("artifacts/seisakuresearch/public/data/config/system");
+    const configDoc = await systemConfigRef.get();
     if (configDoc.exists) {
       const configData = configDoc.data();
-      // フロントエンドのトグルが false (DISABLED) の場合
+      // 画面上でスイッチが DISABLED (false) になっていたら、ここで即終了
       if (configData.autoUpdateEnabled === false) {
-        console.log("⚠️ 【判定】画面上で『Daily Auto Update』がオフに設定されているため、今回の巡回処理を安全にスキップします。");
-        return; // ここで処理を終了（緑色のSuccessになります）
+        console.log("⚠️ 【判定】画面上で『Daily Auto Update』がオフ(DISABLED)にされているため、自動スケジュール巡回を安全にスキップします。");
+        return; 
       }
     }
   } catch (configError) {
-    console.log("設定確認中にエラーが発生しました（巡回は続行します）:", configError.message);
+    console.warn("セーフティロック確認中にエラーが発生しました（処理は続行します）:", configError.message);
   }
 
-  const snapshot = await meetingsCol.get();
-  console.log(`開始: ${snapshot.size} 件の会議体をチェックします...`);
+  // --- ここから下は既存のスケジュール判定ロジック ---
+  await db.runTransaction(async (transaction) => {
+    const dailyCheckRef = db.doc("settings/daily_check");
+    const doc = await transaction.get(dailyCheckRef);
+    if (!doc.exists) return;
 
-  for (const doc of snapshot.docs) {
-    const meeting = doc.data();
-    const rawName = meeting.meetingName || meeting['会議名'];
-    const url = meeting.url || meeting['URL'];
+    const data = doc.data();
+    const schedules = data.schedules || [];
+    if (schedules.length === 0) return;
 
-    if (!url || !rawName) continue;
+    const now = new Date();
+    const jstDate = new Date(now.getTime() + 9 * 60 * 60 * 1000);
+    const currentDay = jstDate.getUTCDay();
+    const currentHour = jstDate.getUTCHours();
+    const currentMinute = jstDate.getUTCMinutes();
 
-    try {
-      const response = await axios.get(`${url}${url.includes('?') ? '&' : '?'}t=${Date.now()}`, { 
-        timeout: 30000,
-        headers: { 'User-Agent': 'Mozilla/5.0' } 
-      });
+    let matchedTime = "";
+    for (const s of schedules) {
+      if (!s.enabled) continue;
+      const safeDays = Array.isArray(s.days) ? s.days : [];
+      if (!safeDays.includes(currentDay)) continue;
 
-      const $ = cheerio.load(response.data);
-      $('script, style, noscript').remove();
-      const bodyText = normalizeText($('body').text());
+      const [sHour, sMin] = (s.time || "12:00").split(':').map(Number);
+      const scheduleTotalMin = sHour * 60 + sMin;
+      const currentTotalMin = currentHour * 60 + currentMinute;
 
-      let rounds = [];
-      let rMatch;
-      roundRegex.lastIndex = 0;
-      while ((rMatch = roundRegex.exec(bodyText)) !== null) {
-        const num = rMatch[1] === '元' ? 1 : parseInt(rMatch[1], 10);
-        rounds.push({ str: rMatch[0], num, index: rMatch.index });
+      if (currentTotalMin >= scheduleTotalMin && currentTotalMin < scheduleTotalMin + 5) {
+        matchedTime = s.time;
+        break;
       }
-
-      if (rounds.length > 0) {
-        const targetRound = rounds.reduce((p, c) => (p.num > c.num) ? p : c);
-
-        const start = Math.max(0, targetRound.index - 200);
-        const end = Math.min(bodyText.length, targetRound.index + 400);
-        const focusSnippet = bodyText.substring(start, end);
-
-        let candidates = [];
-        let dMatch;
-        dateRegex.lastIndex = 0;
-        while ((dMatch = dateRegex.exec(focusSnippet)) !== null) {
-          const ts = parseDateToTs(dMatch[0]);
-          if (ts > 0) {
-            const dist = Math.abs(dMatch.index - 200);
-            const context = focusSnippet.substring(Math.max(0, dMatch.index - 60), dMatch.index + 60);
-            const bonus = /開催|案内|日時|次第|資料|予定/.test(context) ? 100000 : 0;
-            const penalty = /更新|作成|公開|最終|Last/.test(context) ? 80000 : 0;
-            candidates.push({ str: dMatch[0], ts, score: bonus - penalty - dist });
-          }
-        }
-
-        const bestDate = candidates.length > 0 ? candidates.reduce((p, c) => (p.score > c.score) ? p : c) : null;
-        
-        const currentTs = meeting.latestDateTimestamp || 0;
-        const currentRoundNum = meeting.meetingRound ? 
-          (meeting.meetingRound.match(/\d+/) ? parseInt(meeting.meetingRound.match(/\d+/)[0], 10) : 0) : 0;
-
-        if (targetRound.num > currentRoundNum || (bestDate && bestDate.ts > currentTs)) {
-          const finalDate = bestDate ? bestDate.str : (meeting.latestDateString || "日付不明");
-          const combinedStr = `${finalDate} (${targetRound.str})`;
-
-          await doc.ref.update({
-            latestDateString: combinedStr,
-            '直近開催日': combinedStr,
-            latestDateTimestamp: bestDate ? bestDate.ts : currentTs,
-            meetingRound: targetRound.str,
-            previousDateString: meeting.latestDateString || '',
-            status: 'updated',
-            isManual: false,
-            lastCheckedAt: admin.firestore.FieldValue.serverTimestamp()
-          });
-
-          console.log(`✨ 更新検知: ${rawName} -> ${combinedStr}`);
-          await notifySlack(rawName, combinedStr, url);
-        } else {
-          await doc.ref.update({ lastCheckedAt: admin.firestore.FieldValue.serverTimestamp() });
-        }
-      }
-    } catch (e) {
-      console.error(`[エラー] ${rawName}:`, e.message);
     }
 
-    await new Promise(r => setTimeout(r, 1000));
+    if (!matchedTime) return;
+
+    const todayStr = `${jstDate.getUTCFullYear()}-${jstDate.getUTCMonth()+1}-${jstDate.getUTCDate()}`;
+    runKeyToSave = `${todayStr}_${matchedTime}`;
+
+    if (data.lastRunKey === runKeyToSave) return; 
+
+    transaction.set(dailyCheckRef, { lastRunKey: runKeyToSave }, { merge: true });
+    shouldTrigger = true;
+  });
+
+  if (shouldTrigger) {
+    console.log("⏰ 自動スケジュールによる一括巡回を開始します:", runKeyToSave);
+    await triggerMassiveParallelCheck();
   }
-  console.log('完了: すべての巡回が終了しました。');
+});
+
+/**
+ * 手動実行用のAPI（Callable型）
+ */
+exports.startMassiveCheck = onCall({ 
+  memory: "2GiB", 
+  timeoutSeconds: 1800 
+}, async (request) => {
+  console.log("🚀 手動一括チェックの実行リクエストを受信しました。");
+  const result = await triggerMassiveParallelCheck();
+  return result;
+});
+
+/**
+ * 安定スロットリング並行巡回エンジン
+ */
+async function triggerMassiveParallelCheck() {
+  const snapshot = await db.collection("items").get();
+  const items = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+  const totalCount = items.length;
+  
+  if (totalCount === 0) {
+    return { status: "No items", total: 0 };
+  }
+
+  const startTime = Date.now();
+  
+  // 💡 【改善⑫】過去の lastResult が消えないように merge: true に修正
+  await db.doc("settings/status").set({
+    isRunning: true,
+    isManualRunning: false,
+    totalCount: totalCount,
+    currentCount: 0,
+    progress: 0,
+    message: "安定並行スロットリングで巡回中...",
+    startTime: startTime,
+    lastUpdatedAt: startTime
+  }, { merge: true });
+
+  const CONCURRENCY_LIMIT = 30; 
+  let activeIndex = 0;
+  let completedSuccessCount = 0;
+  let lastUpdateTime = Date.now();
+
+  const runWorker = async () => {
+    while (activeIndex < items.length) {
+      const currentIndex = activeIndex++;
+      const item = items[currentIndex];
+      
+      try {
+        await processSingleUrl(item);
+      } catch (err) {
+        console.error(`❌ [${item.id}] 巡回処理中にエラー:`, err.message);
+      }
+
+      completedSuccessCount++;
+      const now = Date.now();
+      
+      if (now - lastUpdateTime > 3000 || completedSuccessCount === totalCount) {
+        lastUpdateTime = now;
+        const currentProgress = Math.min(Math.round((completedSuccessCount / totalCount) * 100), 100);
+        await db.doc("settings/status").update({
+          currentCount: completedSuccessCount,
+          progress: currentProgress,
+          lastUpdatedAt: now
+        }).catch(e => console.warn("ステータス更新エラー回避:", e.message));
+      }
+    }
+  };
+
+  const workers = [];
+  for (let i = 0; i < Math.min(CONCURRENCY_LIMIT, totalCount); i++) {
+    workers.push(runWorker());
+  }
+  await Promise.all(workers);
+
+  const endNow = Date.now();
+  const diffSec = Math.floor((endNow - startTime) / 1000);
+  const m = Math.floor(diffSec / 60);
+  const s = diffSec % 60;
+  
+  // 💡 【改善④】時間表示ロジックを元の正確なものに修正
+  const h = Math.floor(m / 60);
+  const remM = m % 60;
+  const timeStr = h > 0 ? `${h}時間${remM}分${s}秒` : (m > 0 ? `${m}分${s}秒` : `${s}秒`);
+
+  await db.doc("settings/status").update({
+    isRunning: false,
+    progress: 100,
+    message: "全ての巡回が完了しました",
+    lastUpdatedAt: endNow,
+    lastResult: {
+      startTime: startTime,
+      finishedAt: endNow,
+      durationStr: `${timeStr} (${totalCount}件完了)`,
+      totalChecked: totalCount
+    }
+  });
+
+  return { status: "Check completed", total: totalCount, duration: timeStr };
 }
 
-runCheck();
+/**
+ * 3. 判定ロジック
+ */
+async function processSingleUrl(item) {
+  const nowStr = new Date().toISOString();
+  let isSelectorDead = false;
+  let selectorErrorMessage = "";
+
+  try {
+    const result = await fetchHtmlContent(item.url);
+    if (result.error) throw new Error(result.error);
+
+    const html = result.html;
+    const $ = cheerio.load(html);
+
+    $('script, style, noscript, iframe, svg, canvas, meta, link, form, input, select, textarea, button').remove();
+    $('[style*="display: none"], [style*="display:none"], .hidden, [hidden], .sr-only, .visually-hidden').remove();
+    $('a[href^="#"]').remove();
+
+    if (item.excludeSelector) {
+      try {
+        $(item.excludeSelector).remove(); 
+      } catch (e) {
+        console.warn(`[${item.id}] Invalid exclude selector: ${item.excludeSelector}`);
+      }
+    }
+
+    let cleanText = "";
+    let normalizedLinks = "";
+
+    // 🎯 スナイパーモードの処理
+    if (item.targetSelector) {
+      if ($(item.targetSelector).length === 0) {
+        isSelectorDead = true;
+        selectorErrorMessage = `指定された監視エリア「${item.targetSelector}」がページ内に見つかりません。サイト構造が変更された可能性があります。`;
+        throw new Error(`【セレクタ失効警告】${selectorErrorMessage}`);
+      }
+      
+      const targetArea = $(item.targetSelector);
+      cleanText = targetArea.text().replace(/[\s\u3000\u00A0\t\r\n]+/g, ' ').trim();
+      
+      let links = [];
+      targetArea.find('a[href]').each((i, el) => {
+        let href = $(el).attr('href');
+        if (href && !href.startsWith('javascript:') && !href.startsWith('mailto:')) {
+           const cleanHref = href.split('?')[0].split('#')[0];
+           const fileName = cleanHref.split('/').pop();
+           if (fileName && fileName.length > 3) {
+             links.push(fileName.replace(/[a-zA-Z0-9]{25,}/g, 'HASH'));
+           }
+        }
+      });
+      normalizedLinks = [...new Set(links)].sort().join('|');
+    } 
+    // 🛡️ 全自動フィルターモード
+    else {
+      $('*').each((i, el) => {
+        const id = ($(el).attr('id') || '').toLowerCase();
+        const cls = ($(el).attr('class') || '').toLowerCase();
+        const attrText = id + ' ' + cls;
+        
+        const isProtected = ['main', 'content', 'article', 'body', 'list', 'result', 'news', 'press', 'info', 'data', 'feed'].some(w => attrText.includes(w));
+        if (isProtected) return;
+        
+        const isNoise = [
+          'nav', 'menu', 'side', 'head', 'foot', 'banner', 'util', 'tool',
+          'bread', 'path', 'pankuzu', 'share', 'sns', 'social', 'print', 'lang',
+          'pagetop', 'page-top', 'warptop', 'sitemap',
+          'search-box', 'search_box', 'search-form', 'search_form'
+        ].some(word => attrText.includes(word));
+
+        const isExactSidebar = ['sub', 'local', 'left', 'right', 'navi'].some(word => {
+          return id === word || cls.split(' ').includes(word) || id.includes('navi') || cls.includes('navi');
+        });
+
+        if (isNoise || isExactSidebar) $(el).remove();
+      });
+
+      let mainContent = $('main, #main, #contents, #content, .l-contentBody, article, .main-content, #mainContents, .main_contents, #center, #mainArea');
+      if (mainContent.length === 0) mainContent = $('body'); 
+
+      cleanText = mainContent.text().replace(/[\s\u3000\u00A0\t\r\n]+/g, ' ').trim();
+
+      cleanText = cleanText.replace(/[\(（][月火水木金土日祝][\)）]/g, ''); 
+      cleanText = cleanText.replace(/\d+(秒|分|時間|日|週間|ヶ月|年)[前]/g, '[TIME]'); 
+      cleanText = cleanText.replace(/\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2},? \d{4}\b/gi, '[DATE]'); 
+
+      cleanText = cleanText.replace(/(最終)?更新(年月)?日\s*[:：]?\s*.+/g, '[UPDATED]');
+      cleanText = cleanText.replace(/((?:令和|平成|昭和|[RHS])?\s*\d{1,4}\s*[年/.-]\s*\d{1,2}\s*[月/.-](?:\s*\d{1,2}\s*[日号])?)\s*(分|期|度|版|公表|発表|速報|確報|次)/g, 'PROTECTED_DATE_$1_$2');
+      cleanText = cleanText.replace(/(現在)?\s*[\(（]?\s*(令和|平成|昭和|[RHS])?\s*\d{1,4}\s*[年/.-]\s*\d{1,2}\s*[月/.-]\s*\d{1,2}\s*[日]?\s*(現在)?\s*[\)）]?/g, '[DATE]');
+      cleanText = cleanText.replace(/\d{1,2}\s*時\s*\d{1,2}\s*分(?:\s*\d{1,2}\s*秒)?/g, '[TIME]');
+      cleanText = cleanText.replace(/\d{1,2}:\d{2}(:\d{2})?/g, '[TIME]');
+      cleanText = cleanText.replace(/PROTECTED_DATE_(.+?)_(.+?)/g, '$1$2');
+      cleanText = cleanText.replace(/[a-zA-Z0-9]{25,}/g, '[HASH]');
+      cleanText = cleanText.replace(/\d{5,}/g, '[NUM]');
+
+      let links = [];
+      mainContent.find('a[href]').each((i, el) => {
+        let href = $(el).attr('href');
+        if (href && !href.startsWith('javascript:') && !href.startsWith('mailto:')) {
+          const cleanHref = href.split('?')[0].split('#')[0];
+          const fileName = cleanHref.split('/').pop();
+          if (fileName && fileName.length > 3 && !fileName.match(/^[0-9]+$/)) {
+             links.push(fileName.replace(/[a-zA-Z0-9]{25,}/g, 'HASH'));
+          }
+        }
+      });
+      normalizedLinks = [...new Set(links)].sort().join('|');
+    }
+
+    const finalString = `TEXT:${cleanText} LINKS:${normalizedLinks}`;
+
+    const hashString = crypto
+      .createHash("sha256")
+      .update(finalString)
+      .digest("hex");
+
+    const isChanged = (item.contentHash || item.lastHash) !== hashString;
+
+    // 💡 【改善⑥】Firestoreの1MB制限対策（50KB相当で切り捨て）
+    const MAX_TEXT_LENGTH = 50000;
+    const truncatedText = cleanText.length > MAX_TEXT_LENGTH 
+      ? cleanText.slice(0, MAX_TEXT_LENGTH) + '\n...[省略されました]' 
+      : cleanText;
+
+    const updateData = {
+      lastCheckedAt: nowStr,
+      status: isChanged ? 'changed' : 'ok',
+      contentHash: hashString,
+      lastHash: hashString,
+      hasUpdate: isChanged,
+      currentText: truncatedText, // 💡 【改善③】最新のテキストは常に currentText に保存
+    };
+
+    // 💡 【改善⑨】バッチ処理による安全なデータベース更新
+    const batch = db.batch();
+    const itemRef = db.collection("items").doc(item.id);
+
+    if (isChanged) {
+      // 変化があった時だけ、以前のテキストを previousText に退避
+      updateData.previousText = item.currentText || "";
+      updateData.lastChangedAt = nowStr;
+
+      const notifRef = db.collection("notifications").doc();
+      batch.set(notifRef, {
+        itemId: item.id,
+        itemName: item.name || "名称未設定",
+        url: item.url,
+        detectedAt: nowStr,
+        type: "update",
+        status: "unread",
+        message: `${item.name} に更新がありました。`
+      });
+    }
+
+    batch.update(itemRef, updateData);
+    await batch.commit();
+
+  } catch (error) {
+    const batch = db.batch();
+    const itemRef = db.collection("items").doc(item.id);
+    
+    batch.update(itemRef, {
+      lastCheckedAt: nowStr,
+      status: 'error',
+      errorMessage: error.message
+    });
+
+    // 💡 【改善⑦】セレクタ失効時には、管理者が気付けるように明確な警告通知を発行
+    if (isSelectorDead) {
+      const notifRef = db.collection("notifications").doc();
+      batch.set(notifRef, {
+        itemId: item.id,
+        itemName: item.name || "名称未設定",
+        url: item.url,
+        detectedAt: nowStr,
+        type: "selector_dead",
+        status: "unread",
+        message: `【警告】${item.name} の監視エリアが消失しました。サイトが更新された可能性があります。`
+      });
+    }
+
+    await batch.commit();
+  }
+}
+
+/**
+ * 4. 選択チェック（個別）用の単体実行エンドポイント
+ */
+exports.checkUrl = onRequest({ timeoutSeconds: 120, memory: "1GiB" }, async (req, res) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  if (req.method === 'OPTIONS') {
+    res.set('Access-Control-Allow-Methods', 'POST');
+    res.set('Access-Control-Allow-Headers', 'Content-Type');
+    return res.status(204).send('');
+  }
+  
+  try {
+    const url = req.body.data?.url || req.body.url;
+    if (!url) return res.status(400).json({ data: { error: "No URL provided" }});
+    const result = await fetchHtmlContent(url);
+    res.status(200).json({ data: result });
+  } catch (e) {
+    res.status(500).json({ data: { error: e.message }});
+  }
+});
+
+/**
+ * 5. スクレイピング処理（自動リトライ＆JSレンダリング対応化）
+ */
+async function fetchHtmlContent(targetUrl, retries = 2) {
+  const API_TOKEN = process.env.BRIGHT_DATA_API_TOKEN;
+  const ZONE_NAME = process.env.BRIGHT_DATA_ZONE_NAME || 'policy_research';
+
+  if (!API_TOKEN) {
+    throw new Error("Bright Data API Token is not configured in the environment.");
+  }
+
+  for (let attempt = 1; attempt <= retries + 1; attempt++) {
+    try {
+      const response = await axios.post(
+        'https://api.brightdata.com/request',
+        {
+          zone: ZONE_NAME,
+          url: targetUrl,
+          format: 'raw',
+          data_format: 'html', // 💡 【改善②】JSレンダリング結果の確実な取得を指定
+        },
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${API_TOKEN}`
+          },
+          timeout: 60000
+        }
+      );
+
+      return { html: typeof response.data === 'string' ? response.data : JSON.stringify(response.data) };
+
+    } catch (error) {
+      const errMsg = error.response?.data?.message || error.message;
+      const status = error.response?.status;
+      
+      // 💡 【改善⑤】HTTPステータスを見て、404や403など恒久的なエラーの場合はリトライせずに即終了（コスト削減）
+      const isRetryable = !status || status >= 500 || status === 429 || status === 408;
+
+      if (!isRetryable || attempt > retries) {
+        console.error(`Bright Data API Error (${targetUrl}) [Status: ${status}]:`, errMsg);
+        return { error: errMsg };
+      }
+      
+      // リトライ可能なエラーの場合のみ指数バックオフ
+      await new Promise(resolve => setTimeout(resolve, attempt * 2000));
+    }
+  }
+}
+
+/**
+ * 6. AIによるスクリーンショット自動解析API
+ */
+exports.analyzeScreenshot = onCall({ 
+  region: "asia-northeast1", 
+  memory: "1GiB" 
+}, async (request) => {
+  try {
+    const base64Image = request.data.image; 
+    const apiKey = process.env.GEMINI_API_KEY; 
+    
+    if (!apiKey) {
+      throw new HttpsError('invalid-argument', "Gemini API Key is not configured in the environment.");
+    }
+
+    const genAI = new GoogleGenerativeAI(apiKey);
+    
+    const model = genAI.getGenerativeModel({ 
+      model: "gemini-2.5-flash",
+      generationConfig: { 
+        responseMimeType: "application/json" 
+      }
+    });
+
+    const prompt = `
+      あなたはプロのWebスクレイピングエンジニアです。
+      送られた画像は、ある官公庁や研究所のWebサイトの「開発者ツール（検証画面）」のスクリーンショットです。
+      この画像から、新着情報や本文のリストを囲んでいる最も適切なメインのHTML要素の class または id を推測してください。
+      また、そのリストの中に「毎回変わるノイズ（更新日など）」があれば、除外すべき要素として推測してください。
+      
+      必ず指定されたフォーマットのJSONオブジェクトのみを返却してください。
+      {
+        "targetSelector": "#news-list のような監視すべきCSSセレクタ（不明な場合は空文字）",
+        "excludeSelector": ".date のような除外すべきCSSセレクタ（不明な場合は空文字）",
+        "reason": "なぜそのように判断したか、初心者向けに日本語で優しい解説（200文字以内）"
+      }
+    `;
+
+    const requestBody = [
+      prompt,
+      {
+        inlineData: {
+          mimeType: "image/jpeg",
+          data: base64Image.split(',')[1]
+        }
+      }
+    ];
+
+    const result = await model.generateContent(requestBody);
+    const responseText = result.response.text().trim();
+    
+    return JSON.parse(responseText);
+
+  } catch (error) {
+    console.error("AI Analysis Error:", error);
+    throw new HttpsError('internal', 'AIの解析中にエラーが発生しました: ' + error.message);
+  }
+});
+
+/**
+ * 7. 💡 【改善⑧】定期クリーンアップ（古い通知の削除）
+ * 毎日深夜3時に動作し、30日以上経過した通知を自動で削除して無限増殖を防ぎます。
+ */
+exports.cleanupOldNotifications = onSchedule({
+  schedule: "0 3 * * *",
+  timeZone: "Asia/Tokyo",
+  memory: "256MiB"
+}, async (event) => {
+  const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+  
+  const snapshot = await db.collection("notifications")
+    .where("detectedAt", "<", thirtyDaysAgo)
+    .limit(500)
+    .get();
+
+  if (snapshot.empty) {
+    console.log("削除対象の古い通知はありません。");
+    return;
+  }
+
+  const batch = db.batch();
+  snapshot.docs.forEach((doc) => {
+    batch.delete(doc.ref);
+  });
+
+  await batch.commit();
+  console.log(`${snapshot.size} 件の古い通知を削除しました。`);
+});
